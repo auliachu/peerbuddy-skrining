@@ -1,0 +1,6 @@
+project_id = "peerbuddy-skrining"
+
+# Endpoint publik menerima peserta tanpa akun. Validasi, origin, dan pembatasan
+# pengiriman dilakukan handler. Submit RPC di database hanya untuk service_role.
+[functions.submit-screening]
+verify_jwt = false
