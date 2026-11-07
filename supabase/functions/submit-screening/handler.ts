@@ -5,6 +5,12 @@ type Participant = {name:string;age:number;gender:string;email:string;whatsapp:s
 type Submission = {request_id:string;retry_token:string;instrument_version:string;consent_version:string;consent_data:boolean;consent_contact:boolean;participant:Participant;answers:number[]};
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
+function accessCode(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const code=value.replace(/[\s-]/g,'').toUpperCase();
+  return /^[0-9A-F]{32}$/.test(code) ? code : '';
+}
+
 export function validateSubmission(input: unknown): {data?:Submission;error?:string} {
   if (!input || typeof input!=='object') return {error:'Format pengiriman tidak sesuai.'};
   const body=input as Submission, p=body.participant;
@@ -42,17 +48,31 @@ export function createHandler(env:Environment,transport:typeof fetch=fetch){
       const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}raw=new TextDecoder().decode(bytes);
     }catch{return reply({error:'Data pengiriman tidak dapat dibaca.'},400);}
     let input:unknown;try{input=JSON.parse(raw);}catch{return reply({error:'Format pengiriman tidak sesuai.'},400);}
-    const validation=validateSubmission(input);if(validation.error)return reply({error:validation.error},400);
-    const data=validation.data!;
-    const {retry_token,...databasePayload}=data;
-    const clientIP=(request.headers.get('cf-connecting-ip')||request.headers.get('x-real-ip')||request.headers.get('x-forwarded-for')?.split(',')[0]||'unavailable').trim();
-    const hashes=await Promise.all([digest(retry_token),digest(JSON.stringify(databasePayload)),digest(env.rateSalt+'|'+clientIP)]);
+    const body=input && typeof input==='object' ? input as Record<string,unknown> : {};
+    const code=accessCode(body.access_code);
+    const deny=()=>reply({access_denied:true,error:'Kode akses tidak valid, sudah dipakai, dicabut, atau sesi telah berakhir.'},403);
+    if (!code) return deny();
+    const hash=await digest(code);
     const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),15000);
+    const rpc=(name:string,payload:unknown)=>transport(env.url+'/rest/v1/rpc/'+name,{
+      method:'POST',headers:{apikey:env.serviceKey,Authorization:'Bearer '+env.serviceKey,'Content-Type':'application/json'},
+      body:JSON.stringify(payload),signal:controller.signal
+    });
     try{
-      const response=await transport(env.url+'/rest/v1/rpc/submit_screening',{method:'POST',headers:{apikey:env.serviceKey,Authorization:'Bearer '+env.serviceKey,'Content-Type':'application/json'},body:JSON.stringify({p_data:databasePayload,p_token_hash:hashes[0],p_payload_hash:hashes[1],p_rate_key:hashes[2]}),signal:controller.signal});
+      if(body.action==='check_access'){
+        const check=await rpc('check_screening_access',{p_hash:hash});
+        if(!check.ok) return reply({error:'Kode belum dapat diperiksa. Coba lagi.'},503);
+        return await check.json()===true ? reply({allowed:true}) : deny();
+      }
+      const validation=validateSubmission(input);if(validation.error)return reply({error:validation.error},400);
+      const {retry_token,...validated}=validation.data!;
+      const databasePayload={...validated,access_hash:hash};
+      const clientIP=(request.headers.get('cf-connecting-ip')||request.headers.get('x-real-ip')||request.headers.get('x-forwarded-for')?.split(',')[0]||'unavailable').trim();
+      const hashes=await Promise.all([digest(retry_token),digest(JSON.stringify(databasePayload)),digest(env.rateSalt+'|'+clientIP)]);
+      const response=await rpc('submit_screening',{p_data:databasePayload,p_token_hash:hashes[0],p_payload_hash:hashes[1],p_rate_key:hashes[2]});
       const result=await response.json().catch(()=>({}));
-      if(!response.ok){const message=String(result.message||'');if(message.includes('RATE_LIMITED'))return reply({error:'Pengiriman sedang padat. Coba kembali beberapa saat lagi.'},429);if(message.includes('SUBMISSION_CONFLICT'))return reply({error:'Kode pengisian sudah digunakan untuk data berbeda. Hubungi PeerBuddy dengan kode pengisian ini.'},409);return reply({error:'Penyimpanan belum dapat dikonfirmasi. Coba pengiriman kembali.'},503);}
-      if(result.saved!==true||result.request_id!==data.request_id||typeof result.receipt_code!=='string'||!Number.isFinite(Date.parse(result.created_at)))return reply({error:'Konfirmasi penyimpanan belum tersedia. Coba kembali.'},503);
+      if(!response.ok){const message=String(result.message||'');if(message.includes('ACCESS_DENIED'))return deny();if(message.includes('RATE_LIMITED'))return reply({error:'Pengiriman sedang padat. Coba kembali beberapa saat lagi.'},429);if(message.includes('SUBMISSION_CONFLICT'))return reply({error:'Kode pengisian sudah digunakan untuk data berbeda. Hubungi PeerBuddy dengan kode pengisian ini.'},409);return reply({error:'Penyimpanan belum dapat dikonfirmasi. Coba pengiriman kembali.'},503);}
+      if(result.saved!==true||result.request_id!==validated.request_id||typeof result.receipt_code!=='string'||!Number.isFinite(Date.parse(result.created_at)))return reply({error:'Konfirmasi penyimpanan belum tersedia. Coba kembali.'},503);
       // Return only a receipt. No identities, answers, or mental-health scores.
       return reply({saved:true,request_id:result.request_id,receipt_code:result.receipt_code,created_at:result.created_at});
     }catch{return reply({error:'Koneksi penyimpanan terganggu. Coba pengiriman kembali dengan data yang sama.'},503);}finally{clearTimeout(timeout);}

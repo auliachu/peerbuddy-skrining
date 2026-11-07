@@ -11,3 +11,10 @@
 .hero-description-space{height:83.25px;margin-bottom:16px}.organizer-space{height:19.8px}
 @media(min-width:651px) and (max-width:850px){.hero-description-space{height:111px}}
 @media(max-width:650px){.hero-description-space{height:103.6px}}
+
+.access-entry{margin:1rem 0;max-width:32rem}
+.access-panel{margin:1rem 0;padding:1.25rem}
+.access-panel summary{cursor:pointer;margin-bottom:.75rem}
+.access-grid{display:flex;align-items:end;gap:.8rem;flex-wrap:wrap;margin:1rem 0}
+.access-grid .field{flex:1 1 12rem}
+.access-panel textarea{width:100%;padding:.65rem;font:inherit}

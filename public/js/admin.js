@@ -7,7 +7,7 @@
   const columns='id,receipt_code,created_at,instrument_version,name,age,gender,email,whatsapp,answers,consent_data,consent_contact,consent_version,depression_score,anxiety_score,stress_score,followup_status,contacted_at';
   try{session=JSON.parse(sessionStorage.getItem('peerbuddy-admin-session-v1'));}catch{}
   function persistSession(){try{if(session)sessionStorage.setItem('peerbuddy-admin-session-v1',JSON.stringify(session));else sessionStorage.removeItem('peerbuddy-admin-session-v1');}catch{}}
-  function clearSession(){session=null;persistSession();records=[];total=0;cursor=null;exhausted=false;$('submissions-body').replaceChildren();$('admin-detail').replaceChildren();$('admin-detail').hidden=true;$('dashboard-section').hidden=true;$('login-section').hidden=false;$('admin-password').value='';}
+  function clearSession(){accessPanel.open=false;wipeBatch();events=[];$('event-select').replaceChildren();$('revoke-code').value='';$('access-admin-status').textContent='';session=null;persistSession();records=[];total=0;cursor=null;exhausted=false;$('submissions-body').replaceChildren();$('admin-detail').replaceChildren();$('admin-detail').hidden=true;$('dashboard-section').hidden=true;$('login-section').hidden=false;$('admin-password').value='';}
   async function refreshSession(){if(refreshPromise)return refreshPromise;refreshPromise=(async()=>{if(!session?.refresh_token)throw new Error('Sesi berakhir. Masuk kembali.');const response=await fetch(cfg.supabaseUrl+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:cfg.supabasePublishableKey,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})});if(!response.ok){clearSession();throw new Error('Sesi berakhir. Masuk kembali.');}session=await response.json();session.expires_at=Math.floor(Date.now()/1000)+session.expires_in;persistSession();})().finally(()=>refreshPromise=null);return refreshPromise;}
   async function api(path,options={},retry=true){
     if(!session?.access_token)throw new Error('Masuk sebagai admin terlebih dahulu.');
@@ -33,6 +33,80 @@
   function filename(suffix){return'peerbuddy-'+(demo?'DEMO-':'')+suffix+'-'+new Date().toISOString().slice(0,10);}
   async function exportAll(excel){if(exporting)return;exporting=true;error('');const button=$(excel?'export-excel':'export-all'),label=button.textContent;button.textContent='Menyiapkan unduhan…';$('export-all').disabled=true;$('export-excel').disabled=true;try{const rows=core.summaryRows(await allRecords(),$('anonymous-export').checked);if(excel){const bytes=await window.PB_EXCEL.workbook([{name:'Rekap peserta',rows},{name:'Kamus pertanyaan',rows:codebook()}]);core.download(bytes,filename('rekap')+'.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');}else core.download(core.csv(rows),filename('rekap')+'.csv','text/csv;charset=utf-8');}catch(e){error(e.message);}finally{exporting=false;button.textContent=label;$('export-all').disabled=false;$('export-excel').disabled=false;}}
   function detail(r){const el=$('admin-detail');el.hidden=false;el.innerHTML='<div class="card-heading"><h2>'+esc(r.name)+'</h2><button type="button" class="text-button" id="close-detail">Tutup</button></div><p class="small muted">'+esc(r.receipt_code)+' · '+esc(r.email)+' · +'+esc(r.whatsapp)+'</p><div class="admin-result-summary">'+core.interpretScores({depression:r.depression_score,anxiety:r.anxiety_score,stress:r.stress_score}).map(result=>'<article class="result-card result-level-'+result.level+'"><div class="result-card-heading"><h3>'+esc(result.title)+' · '+result.score+' / 42</h3><span class="result-category">'+esc(result.category)+'</span></div><p class="result-description">'+esc(result.description)+'</p></article>').join('')+'</div><p class="small muted">Hasil skrining bukan diagnosis. Skor setiap aspek adalah penjumlahan 14 butir tanpa pengali dua. Ringkasan yang sama ditampilkan kepada peserta setelah pengiriman berhasil.</p><div class="page-actions"><button type="button" class="button primary" id="detail-csv">Unduh 42 jawaban CSV</button><button type="button" class="button secondary" id="mark-contacted">'+(r.followup_status==='contacted'?'Tandai belum ditindaklanjuti':'Tandai sudah dihubungi')+'</button></div>'+q.questions.map((text,i)=>'<div class="review-answer"><span class="number">'+(i+1)+'</span><div><p>'+esc(text)+'</p><small>'+r.answers[i]+' — '+esc(q.options[r.answers[i]])+'</small></div></div>').join('');$('close-detail').onclick=()=>el.hidden=true;$('detail-csv').onclick=()=>core.download(core.csv(core.individualRows(r)),filename(r.receipt_code)+'.csv','text/csv;charset=utf-8');$('mark-contacted').onclick=async()=>{const button=$('mark-contacted');button.disabled=true;try{const next=r.followup_status==='contacted'?'pending':'contacted';if(!demo)await api('/rest/v1/screening_submissions?id=eq.'+encodeURIComponent(r.id),{method:'PATCH',body:JSON.stringify({followup_status:next,contacted_at:next==='contacted'?new Date().toISOString():null})});r.followup_status=next;render();detail(r);}catch(e){error(e.message);button.disabled=false;}};el.scrollIntoView({block:'start',behavior:'instant'});}
+  let events=[],codeBatch=[],accessBusy=false;
+  const accessPanel=$('access-admin');
+  accessPanel.hidden=demo;
+  async function access(action,args={}) {
+    const response=await api('/rest/v1/rpc/manage_screening_access',{
+      method:'POST',body:JSON.stringify({p_action:action,p_args:args})
+    });
+    return response.json();
+  }
+  function wipeBatch() {
+    codeBatch=[]; $('code-list').value=''; $('code-batch').hidden=true;
+  }
+  function renderEvent() {
+    const row=events.find(e=>e.id===$('event-select').value);
+    $('event-info').textContent=row
+      ? (row.active?'Aktif':'Ditutup atau kedaluwarsa')+' · '+row.total+' dibuat · '+row.used+' dipakai · '+row.revoked+' dicabut · Tutup '+new Date(row.ends_at).toLocaleString('id-ID')
+      : 'Belum ada sesi. Buat sesi untuk menerbitkan kode.';
+    for (const id of ['generate-form','revoke-form','event-close']) $(id).hidden=!row?.active;
+  }
+  async function refreshEvents(preferred=$('event-select').value) {
+    events=await access('list');
+    const select=$('event-select');
+    select.replaceChildren();
+    for(const row of events) {
+      const option=document.createElement('option'); option.value=row.id; option.textContent=row.name; select.append(option);
+    }
+    if(events.some(row=>row.id===preferred)) select.value=preferred;
+    renderEvent();
+  }
+  async function accessTask(work) {
+    if (accessBusy || demo) return;
+    accessBusy=true; $('event-select').disabled=true;
+    $('access-admin-status').textContent='Memproses…';
+    try { $('access-admin-status').textContent=await work() || ''; }
+    catch(e) { $('access-admin-status').textContent=e.message; }
+    finally { accessBusy=false; $('event-select').disabled=false; }
+  }
+  accessPanel.addEventListener('toggle',()=>{if(accessPanel.open)accessTask(()=>refreshEvents());});
+  $('event-select').addEventListener('change',()=>{wipeBatch();renderEvent();});
+  $('event-form').addEventListener('submit',e=>{
+    e.preventDefault();
+    accessTask(async()=>{
+      const ends=new Date($('event-end').value);
+      if(!Number.isFinite(+ends) || +ends<=Date.now())throw new Error('Waktu tutup harus setelah waktu sekarang.');
+      const row=await access('create',{name:$('event-name').value,ends_at:ends.toISOString()});
+      wipeBatch(); await refreshEvents(row.id); e.target.reset(); return 'Sesi dibuat.';
+    });
+  });
+  $('generate-form').addEventListener('submit',e=>{
+    e.preventDefault();
+    accessTask(async()=>{
+      const id=$('event-select').value;
+      const quantity=Number($('code-quantity').value);
+      const batch=await access('generate',{event_id:id,quantity});
+      if(!session) return '';
+      await refreshEvents(id).catch(()=>{});
+      codeBatch=batch;
+      $('code-list').value=codeBatch.join('\n');$('code-batch').hidden=false;
+      return codeBatch.length+' kode baru dibuat. Unduh atau salin sebelum meninggalkan halaman.';
+    });
+  });
+  $('code-download').addEventListener('click',()=>{if(codeBatch.length)core.download(core.csv([['kode_akses'],...codeBatch.map(c=>[c])]),'peerbuddy-kode-akses.csv','text/csv;charset=utf-8');});
+  $('revoke-form').addEventListener('submit',e=>{
+    e.preventDefault();
+    accessTask(async()=>{
+      const result=await access('revoke',{event_id:$('event-select').value,code:$('revoke-code').value});
+      $('revoke-code').value=''; await refreshEvents(); return result.changed?'Kode dicabut.':'Kode tidak ditemukan atau sudah tidak bisa dicabut.';
+    });
+  });
+  $('event-close').addEventListener('click',()=>{
+    const id=$('event-select').value;
+    if(!id || !window.confirm('Tutup sesi ini sekarang? Kode yang belum dipakai akan berhenti berlaku.'))return;
+    accessTask(async()=>{await access('close',{event_id:id});wipeBatch();await refreshEvents(id);return 'Sesi ditutup.';});
+  });
   $('login-form').addEventListener('submit',async e=>{e.preventDefault();$('login-error').hidden=true;const button=$('login-button');button.disabled=true;try{if(!configured)throw new Error('Website belum terhubung ke Supabase. Ikuti PANDUAN_HOSTING.md pada paket proyek.');const response=await fetch(cfg.supabaseUrl+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:cfg.supabasePublishableKey,'Content-Type':'application/json'},body:JSON.stringify({email:$('admin-email').value.trim(),password:$('admin-password').value})});if(!response.ok)throw new Error('Email atau password tidak sesuai, atau akun belum aktif.');session=await response.json();session.expires_at=Math.floor(Date.now()/1000)+session.expires_in;const permission=await api('/rest/v1/rpc/is_screening_admin',{method:'POST',body:'{}'});if(await permission.json()!==true){clearSession();throw new Error('Akun ini belum diberi akses admin PeerBuddy.');}persistSession();$('admin-password').value='';await dashboard();}catch(e){clearSession();$('login-error').textContent=e.message;$('login-error').hidden=false;}finally{button.disabled=false;}});
   $('logout').addEventListener('click',async()=>{const previous=session;clearSession();if(!demo&&previous?.access_token)try{await fetch(cfg.supabaseUrl+'/auth/v1/logout',{method:'POST',headers:{apikey:cfg.supabasePublishableKey,Authorization:'Bearer '+previous.access_token},signal:AbortSignal.timeout(5000)});}catch{}});
   $('refresh-data').addEventListener('click',()=>load(true));$('load-more').addEventListener('click',()=>load(false));$('admin-search').addEventListener('input',render);$('status-filter').addEventListener('change',render);

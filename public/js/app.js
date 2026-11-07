@@ -6,7 +6,7 @@
   const configured = /^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(cfg.supabaseUrl) && !!cfg.supabasePublishableKey;
   const storageKey = demo ? 'peerbuddy-demo-draft-v1' : 'peerbuddy-screening-draft-v1';
   let sending = false;
-  const blankState = () => ({ version:q.version, consentVersion:cfg.consentVersion, page:1, batch:0, participant:{name:'',age:'',gender:'',email:'',whatsapp:''}, consentData:false, consentContact:false, answers:Array(42).fill(null), requestId:core.randomUUID(), retryToken:core.randomUUID(), pending:null, receipt:null, resultScores:null, expires:Date.now()+7200000 });
+  const blankState = () => ({ version:q.version, consentVersion:cfg.consentVersion, page:1, batch:0, participant:{name:'',age:'',gender:'',email:'',whatsapp:''}, consentData:false, consentContact:false, answers:Array(42).fill(null), requestId:core.randomUUID(), retryToken:core.randomUUID(), accessCode:'', pending:null, receipt:null, resultScores:null, expires:Date.now()+7200000 });
   let state = blankState();
   try {
     const previous = JSON.parse(sessionStorage.getItem(storageKey));
@@ -18,8 +18,10 @@
     if (state.page > 2) state.page=2;
   }
   if (!configured && !demo) state = blankState();
+  if (!demo && !state.accessCode && !state.receipt) state.pending=null;
   function save() { state.expires = Date.now()+7200000; try { sessionStorage.setItem(storageKey,JSON.stringify(state)); } catch {} }
   function show(page, focus = true) {
+    if (!demo && page > 1 && !state.accessCode && !state.receipt) page = 1;
     if (page === 5 && !state.receipt) page = 4;
     if (page > 2 && Object.keys(core.validateParticipant(state.participant)).length) page = 2;
     if (page > 2 && (!state.consentData || !state.consentContact)) page = 2;
@@ -100,10 +102,11 @@
   }
   async function submit() {
     if (sending || state.receipt) return;
+    if (!demo && !state.accessCode) { show(1); return; }
     if (!core.validAnswers(state.answers) || Object.keys(core.validateParticipant(state.participant)).length || !state.consentData || !state.consentContact) { show(2); return; }
     if (!configured && !demo) { $('submit-error').hidden=false; $('submit-error').textContent='Skrining belum dibuka. Hubungi PeerBuddy untuk informasi lebih lanjut.'; return; }
     sending=true; $('submit-error').hidden=true;
-    if (!state.pending) state.pending={ request_id:state.requestId, retry_token:state.retryToken, instrument_version:q.version, consent_version:cfg.consentVersion, consent_data:true, consent_contact:true, participant:{name:state.participant.name.trim(),age:Number(state.participant.age),gender:state.participant.gender,email:state.participant.email.trim().toLowerCase(),whatsapp:core.normalizeWA(state.participant.whatsapp)}, answers:state.answers.slice() };
+    if (!state.pending) state.pending={ access_code:state.accessCode, request_id:state.requestId, retry_token:state.retryToken, instrument_version:q.version, consent_version:cfg.consentVersion, consent_data:true, consent_contact:true, participant:{name:state.participant.name.trim(),age:Number(state.participant.age),gender:state.participant.gender,email:state.participant.email.trim().toLowerCase(),whatsapp:core.normalizeWA(state.participant.whatsapp)}, answers:state.answers.slice() };
     save(); lockPending();
     let timeout;
     try {
@@ -113,13 +116,19 @@
         const controller=new AbortController(); timeout=setTimeout(()=>controller.abort(),20000);
         const response=await fetch(cfg.supabaseUrl+'/functions/v1/submit-screening',{method:'POST',headers:{'Content-Type':'application/json','apikey':cfg.supabasePublishableKey},body:JSON.stringify(state.pending),signal:controller.signal});
         const body=await response.json().catch(()=>({}));
+        if (response.status === 403 && body.access_denied === true) {
+          state.accessCode=''; state.pending=null; show(1);
+          $('access-error').textContent=body.error;
+          $('access-error').hidden=false; $('access-code').focus();
+          return;
+        }
         if (!response.ok) { if (response.status === 400) state.pending=null; throw new Error(body.error || 'Jawaban belum dapat dikonfirmasi tersimpan. Silakan coba kembali.'); }
         if (body.saved !== true || body.request_id !== state.requestId || !/^PB-\d{8}-[A-F0-9]{12}$/.test(body.receipt_code || '') || !Number.isFinite(Date.parse(body.created_at))) throw new Error('Konfirmasi penyimpanan belum diterima. Silakan coba kembali.');
         receipt=body;
       }
       // Retain only the three aggregate scores for this tab's result screen.
       state.resultScores=core.scoreAnswers(state.pending.answers);
-      state.receipt=receipt; state.pending=null;
+      state.receipt=receipt; state.pending=null; state.accessCode=''; $('access-code').value='';
       // Erase identifying data and answers immediately after a confirmed server acknowledgement.
       state.participant={name:'',age:'',gender:'',email:'',whatsapp:''}; state.answers=Array(42).fill(null); state.retryToken=''; state.requestId=''; state.page=5;
       for(let i=1;i<=5;i++) $('page-'+i).hidden=i!==5;
@@ -134,7 +143,33 @@
   $('year').textContent=new Date().getFullYear();
   if (demo) { $('mode-banner').hidden=false;$('mode-banner').textContent='MODE PRATINJAU • Gunakan data contoh. Jawaban tidak dikirim kepada PeerBuddy.'; }
   else if(!configured){$('mode-banner').hidden=false;$('mode-banner').textContent='Skrining belum dibuka. Anda dapat melihat alurnya melalui mode pratinjau.';$('start').disabled=true;$('start').textContent='Skrining belum dibuka';$('demo-link').hidden=!cfg.demoEnabled;}
-  $('start').addEventListener('click',()=>show(2));
+  $('access-entry').hidden=demo || !configured;
+  async function start() {
+    if (demo) { show(2); return; }
+    if (!configured || $('start').disabled) return;
+    const code=$('access-code').value.replace(/[\s-]/g,'').toUpperCase();
+    $('access-error').hidden=true;
+    if (!/^[0-9A-F]{32}$/.test(code)) {
+      $('access-error').textContent='Masukkan kode akses dari panitia.';
+      $('access-error').hidden=false; $('access-code').focus(); return;
+    }
+    $('start').disabled=true;
+    const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),15000);
+    try {
+      const response=await fetch(cfg.supabaseUrl+'/functions/v1/submit-screening',{
+        method:'POST',headers:{'Content-Type':'application/json','apikey':cfg.supabasePublishableKey},
+        body:JSON.stringify({action:'check_access',access_code:code}),signal:controller.signal
+      });
+      const body=await response.json().catch(()=>({}));
+      if (!response.ok || body.allowed !== true) throw new Error(body.error || 'Kode belum dapat diperiksa. Coba lagi.');
+      state.accessCode=code; $('access-code').value=''; show(2);
+    } catch (e) {
+      $('access-error').textContent=e.name==='AbortError' || e instanceof TypeError ? 'Koneksi terganggu. Coba periksa kode kembali.' : e.message;
+      $('access-error').hidden=false;
+    } finally { clearTimeout(timer); $('start').disabled=false; }
+  }
+  $('start').addEventListener('click',start);
+  $('access-code').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();start();}});
   $('data-back').addEventListener('click',()=>{readForm();show(1);});
   $('participant-form').addEventListener('input',readForm);
   $('participant-form').addEventListener('change',readForm);
